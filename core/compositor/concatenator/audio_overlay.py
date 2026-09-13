@@ -7,6 +7,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import subprocess
 from typing import List, Optional, Tuple
 
@@ -772,6 +773,69 @@ class AudioOverlayMixin:
             return False
 
     @staticmethod
+    def _probe_clip_duration(path: str, default: float = 5.0) -> float:
+        """探测媒体文件时长（秒），三级兜底。
+
+        修复 Issue #54：Docker 镜像仅暴露 imageio-ffmpeg 自带的 ``ffmpeg``，
+        不含 ``ffprobe``，``resolve_binary("ffprobe")`` 返回 ``None``；若直接传入
+        ``subprocess.run([None, ...])`` 会在 ``os.path.dirname(None)`` 处抛
+        ``TypeError``。此处按可用性依次尝试：
+
+        1. ``ffprobe``（解析到真实路径时才用）；
+        2. ``ffmpeg -i`` 的 stderr ``Duration:`` 行（ffmpeg 为硬依赖，镜像必有）；
+        3. 调用方给定的 ``default``。
+
+        Args:
+            path: 媒体文件路径。
+            default: 全部探测失败时返回的兜底时长（秒）。
+
+        Returns:
+            时长（秒）；无法探测时返回 ``default``。
+        """
+        # 1) ffprobe（可能为 None，必须先判空）
+        ffprobe = resolve_binary("ffprobe")
+        if ffprobe:
+            try:
+                r = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", path],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+                )
+                val = float((r.stdout or "").strip() or 0)
+                if val > 0:
+                    return val
+            except Exception as e:
+                logger.warning(f"[Compositor] ffprobe duration failed: {e}")
+
+        # 2) ffmpeg stderr 解析（ffmpeg 是硬依赖，Docker 镜像必有）
+        ffmpeg = resolve_binary("ffmpeg")
+        if ffmpeg:
+            try:
+                r = subprocess.run(
+                    [ffmpeg, "-hide_banner", "-i", path],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15,
+                )
+                m = re.search(
+                    r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr or ""
+                )
+                if m:
+                    h, mi, s = m.groups()
+                    val = int(h) * 3600 + int(mi) * 60 + float(s)
+                    if val > 0:
+                        logger.info(
+                            f"[Compositor] duration via ffmpeg fallback: {val:.2f}s ({path})"
+                        )
+                        return val
+            except Exception as e:
+                logger.warning(f"[Compositor] ffmpeg duration probe failed: {e}")
+
+        # 3) 默认兜底
+        logger.warning(
+            f"[Compositor] duration probe unavailable for {path}, using default {default}s"
+        )
+        return default
+
+    @staticmethod
     def composite_anchor_video(
         clip_path: str,
         audio_path: str,
@@ -810,14 +874,8 @@ class AudioOverlayMixin:
         )
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        # Step 1: Get clip duration
-        probe = subprocess.run(
-            [resolve_binary("ffprobe"), "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", clip_path],
-            stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=15,
-        )
-        clip_duration = float(probe.stdout.strip() or 5.0)
+        # Step 1: Get clip duration（ffprobe 不可用时回退 ffmpeg，修复 Issue #54）
+        clip_duration = AudioOverlayMixin._probe_clip_duration(clip_path, default=5.0)
         if clip_duration <= 0:
             clip_duration = 5.0
 
