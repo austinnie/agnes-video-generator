@@ -285,8 +285,17 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
     ) -> None:
         """为每个段落生成视频场景描述 prompt（语言跟随输入段落）。
 
-        优化路线图 2.5：LLM 调用相互独立，改为有限并发（3 并发）执行；
+        优化路线图 2.5：LLM 调用相互独立，改为有限并发执行；
         进度语义简化为「开始 → 完成」（避免并发下中间进度乱序回退）。
+
+        v6.4.7 容错：
+        - 单段 LLM 调用失败（reasoning 模型偶发超时 / 5xx / 限流耗尽）
+          不再让整个任务 FAILED。``asyncio.gather(return_exceptions=True)``
+          隔离异常，失败段保留空 scene_prompt，由后续 ``_generate_videos``
+          的 ``if not para.scene_prompt: skip`` 自动跳过；用户 resume 时
+          该段会被重新纳入 pending 再次尝试。
+        - 并发从 3 降到 2：agnes-3.0-flash 单次响应更长，与共享限速桶
+          （单 Key 16/min）叠加时 3 并发更易触发读超时。
         """
         pending = [p for p in paragraphs if not p.scene_prompt]
         if pending:
@@ -295,7 +304,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 f"生成 {len(pending)} 个场景描述...",
                 _PROGRESS_SCENE_PROMPTS_START,
             )
-            sem = asyncio.Semaphore(3)
+            sem = asyncio.Semaphore(2)
 
             async def _gen_one(para: ManuscriptParagraph) -> None:
                 async with sem:
@@ -309,19 +318,47 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                         para.text,
                         self._state.style,
                     )
-                    para.scene_prompt = prompt.strip()
+                    # 防御：LLM 极少数情况可能返回 None / 非 str
+                    para.scene_prompt = (prompt or "").strip() if isinstance(prompt, str) else ""
 
-            await asyncio.gather(*[_gen_one(p) for p in pending])
+            results = await asyncio.gather(
+                *[_gen_one(p) for p in pending],
+                return_exceptions=True,
+            )
+
+            failed: list = [
+                (p, r) for p, r in zip(pending, results)
+                if isinstance(r, BaseException)
+            ]
+            succeeded = len(pending) - len(failed)
+            if failed:
+                logger.warning(
+                    "[Manuscript] scene_prompt: %d/%d 段落生成失败（已隔离）: indices=%s, first_error=%s",
+                    len(failed), len(pending),
+                    [p.index for p, _ in failed],
+                    repr(failed[0][1])[:200],
+                )
+                # 全部失败：无 prompt 也生成不出视频，明确失败而非静默产空片
+                if succeeded == 0:
+                    raise RuntimeError(
+                        f"[Manuscript] 全部 {len(pending)} 段场景描述生成失败，"
+                        f"无法继续：{failed[0][1]}"
+                    ) from failed[0][1]
+
             await self._emit(
                 "scene_prompts", "completed",
-                f"场景描述生成完成 ({len(pending)} 段)",
+                (
+                    f"场景描述生成完成 ({succeeded}/{len(pending)} 段)"
+                    + (f"，{len(failed)} 段失败可 resume 重试" if failed else "")
+                ),
                 _PROGRESS_SCENE_PROMPTS_START + _PROGRESS_SCENE_PROMPTS_SPAN,
             )
             for p in pending:
-                logger.info(
-                    "[Manuscript] scene_prompt %d: %s...",
-                    p.index, p.scene_prompt[:80],
-                )
+                if p.scene_prompt:
+                    logger.info(
+                        "[Manuscript] scene_prompt %d: %s...",
+                        p.index, p.scene_prompt[:80],
+                    )
 
         self.task_manager.update_state(paragraphs=paragraphs)
         self.save_prompts({
@@ -330,7 +367,7 @@ class ManuscriptVideoPipeline(MultiScenePipeline):
                 for p in paragraphs
             ],
         })
-
+        
     async def _generate_videos(self) -> None:
         """为每个段落调用 Agnes Video API 生成视频（两阶段并行）。
 

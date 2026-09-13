@@ -175,7 +175,13 @@ class AgnesChatAPI:
             raise
 
     def chat(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
-        """纯文本 Chat 调用（含重试）。"""
+        """纯文本 Chat 调用（含重试）。
+
+        v6.4.5 起默认文本模型 agnes-3.0-flash 为 reasoning 模型：内部先做
+        chain-of-thought 再产出，长 prompt 响应常超过 120s。原 120s 读超时
+        会在生成中途打断；配合 _MAX_RETRIES=3 + 15/30/45s 指数退避，单次调用
+        最坏累计 ~9.5 分钟才最终失败。timeout 提升到 300s，与 chat_multimodal 对齐。
+        """
         logger.info(f"[AgnesChat] Calling chat ({self.model}), prompt: {len(user_prompt)} chars...")
         data = self._request_with_retry(
             {
@@ -187,7 +193,7 @@ class AgnesChatAPI:
                 "temperature": 0.7,
                 "max_tokens": max_tokens,
             },
-            timeout=120,
+            timeout=300,
         )
         return data["choices"][0]["message"]["content"]
 
